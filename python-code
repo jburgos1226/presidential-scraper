@@ -1,0 +1,168 @@
+# Import libraries
+import requests
+import json
+from census import Census
+import csv
+
+# My Census API Key. Hidden for privacy
+CENSUS_API_KEY = "..." 
+
+# Fetch state FIPS codes dynamically from Census API using census library
+def get_state_fips():
+    c = Census(CENSUS_API_KEY, year=2020)
+    try:
+        state_data = c.acs5.state(('NAME', 'STATE'), Census.ALL)
+        state_fips_dict = {state['STATE']: state['NAME'] for state in state_data}
+        return state_fips_dict
+    except Exception as e:
+        print("Failed to fetch state FIPS codes using census library.")
+        print(f"Error: {e}")
+        return {}
+
+
+# Fetch county FIPS and names for a given state using requests and ACS 5-Year Profile directly
+def get_county_fips(state_fips):
+    base_url = "https://api.census.gov/data/2020/acs/acs5/profile"
+    variables = "get=NAME,DP05_0001E" # We'll fetch population too, just in case, but mainly need NAME
+    geo_filter = f"for=county:*&in=state:{state_fips}" # Filter for counties in the given state
+    api_key_param = f"key={CENSUS_API_KEY}"
+
+    url = f"{base_url}?{variables}&{geo_filter}&{api_key_param}" # Construct the full URL
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        data = response.json()
+
+        county_dict = {} # Dictionary to store county FIPS and names
+        header = data[0] # Header row is the first element
+        data_rows = data[1:] # Data rows start from the second element
+
+        name_index = header.index("NAME") # Get index of "NAME"
+        state_fips_index = header.index("state") # Get index of "state" (state FIPS)
+        county_fips_index = header.index("county") # Get index of "county" (county FIPS)
+
+
+        for row in data_rows:
+            county_name = row[name_index]
+            current_state_fips = row[state_fips_index] # State FIPS from the response row
+            county_fips_code = row[county_fips_index] # County FIPS from the response row
+
+            full_county_fips = current_state_fips + county_fips_code.zfill(3) # Combine state and county FIPS
+
+            county_dict[full_county_fips] = county_name # Store in county_dict
+
+        print(f"Successfully fetched county FIPS and names for state {state_fips} using ACS 5-Year Profile.") # Success message
+        return county_dict
+
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch county FIPS and names for state {state_fips} using ACS 5-Year Profile.")
+        print(f"Error: {e}")
+        return {}
+
+
+# Fetch candidate metadata
+def fetch_candidates():
+    url = "https://www.politico.com/election-data/metadata__cycle-2024__candidates/data.json"
+    print("Fetching candidate data from:", url)
+    response = requests.get(url)
+    print("Candidate data request status code:", response.status_code)
+
+    if response.status_code == 200:
+        candidates_data = response.json()
+        print("Candidate data fetched successfully. Number of candidates:", len(candidates_data))
+
+        candidates_dict = {}
+        for cand in candidates_data:
+            candidates_dict[cand["id"]] = {"full_name": cand["fullName"], "short_name": cand["shortName"], "party": cand["party"]}
+        return candidates_dict
+    else:
+        print("Failed to fetch candidate data")
+        return {}
+
+# Fetch and save election results
+def fetch_all_results():
+    candidates_dict = fetch_candidates()
+    state_fips_dict = get_state_fips()
+
+    csv_filename = "election_results_all_states.csv"
+    with open(csv_filename, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["state_fips", "state_name", "county_fips", "county_name", "candidate_id", "full_name", "short_name", "party", "votes", "progress_mode", "progress_pct"])
+
+        for state_fips, state_name in state_fips_dict.items():
+            county_dict = get_county_fips(state_fips)
+            if not county_dict:
+                continue
+
+            url = f"https://www.politico.com/election-data/results__2024-11-05__contests__ap:{state_fips}:0__counties/data.json"
+            response = requests.get(url)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                for county in data.get("counties", []):
+                    county_fips = county["id"]
+                    county_name = county_dict.get(county_fips, "Unknown County")
+                    progress_mode = county["progress"]["mode"]
+                    progress_pct = county["progress"]["pct"]
+
+                    # Initialize 'other' votes for this county - THIS IS CORRECTLY PLACED
+                    other_votes_county = 0
+
+                    for result in county["results"]:
+                        candidate_id_numeric = result["id"]
+                        candidate_id = f"ap:pol:{candidate_id_numeric}"
+
+                        votes = result["votes"]
+
+                        if candidate_id not in candidates_dict:
+                            # Candidate is NOT in our candidates_dict, aggregate votes
+                            other_votes_county += votes # Aggregate votes for "Other" in this county
+                        else:
+                            # Candidate IS in candidates_dict, write their row as before
+                            candidate_info = candidates_dict.get(candidate_id)
+                            full_name = candidate_info["full_name"]
+                            short_name = candidate_info["short_name"]
+                            party = candidate_info["party"]
+                            candidate_id_for_csv = candidate_id
+
+                            writer.writerow([state_fips, state_name, county_fips, county_name, candidate_id_for_csv, full_name, short_name, party, votes, progress_mode, progress_pct])
+
+                    # AFTER processing ALL candidates in the county, write the aggregated "Other" row if needed
+                    if other_votes_county > 0:
+                        writer.writerow([state_fips, state_name, county_fips, county_name, "Other_Aggregated", "Other", "Other", "Third Party", other_votes_county, progress_mode, progress_pct])
+
+
+                print(f"Processed state {state_name} ({state_fips})")
+
+            else:
+                print(f"Failed to fetch data for state {state_fips}. Status code: {response.status_code}")
+
+    print(f"✅ All data saved to {csv_filename}")
+
+def test_simplified_census_api_request(): # Keep test function for verification
+    # **MODIFIED URL - ACS 5-Year Profile - Requesting NAME for all counties in all states**
+    url_simple = "https://api.census.gov/data/2020/acs/acs5/profile?get=NAME&for=county:*&in=state:*&key=..." # **ACS 5-Year Profile URL**
+    print(f"Attempting request to URL: {url_simple}")
+    response = requests.get(url_simple)
+    print("Request completed.")
+
+    if response.status_code == 200:
+        data = response.json()
+        print("Simplified URL Request (ACS 5-Year Profile) - SUCCESS!")
+        print("Response Data (first 5 items):")
+        print(json.dumps(data[:5], indent=2)) # Print first 5 items of response for inspection
+        return True
+    else:
+        print("Simplified URL Request (ACS 5-Year Profile) - FAILED!")
+        print(f"Status code: {response.status_code}")
+        print(f"Response text: {response.text}")
+        return False
+
+
+# Call the test function (keep it to verify API connectivity)
+test_simplified_census_api_request()
+
+# Run the scraper
+fetch_all_results()
